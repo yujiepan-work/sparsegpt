@@ -22,8 +22,21 @@ def get_opt(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import OPTForCausalLM
+
+    # config = transformers.AutoConfig.from_pretrained(model)
+    # config.num_hidden_layers = 2
+    # model = transformers.AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
     model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto')
     model.seqlen = model.config.max_position_embeddings
+
+    # Originally in hf codes, lm_head.weights and embed_tokens.weights shares the same weights.
+    # here we make them independent parameters.
+    assert model.lm_head.weight is model.model.decoder.embed_tokens.weight
+    model.__class__._tied_weights_keys = []
+    from copy import deepcopy
+    model.lm_head.weight = deepcopy(model.lm_head.weight)
+    assert model.lm_head.weight is not model.model.decoder.embed_tokens.weight
+
     return model
 
 @torch.no_grad()
@@ -76,13 +89,27 @@ def opt_sequential(model, dataloader, dev):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
-
+    print(outs.shape, attention_mask.shape)
+    print(attention_mask)
     print('Ready.')
 
+    layers_plus_lmhead = []
     for i in range(len(layers)):
-        layer = layers[i].to(dev)
+        layers_plus_lmhead.append(layers[i])
+    if model.model.decoder.final_layer_norm is not None:
+        print('Add final_layer_norm ')
+        layers_plus_lmhead.append(model.model.decoder.final_layer_norm)
+    if model.model.decoder.project_out is not None:
+        print('Add project_out ')
+        layers_plus_lmhead.append(model.model.decoder.project_out)
+    layers_plus_lmhead.append(model.lm_head)
+    print('Add lm_head ')
+
+    for i in range(len(layers_plus_lmhead)):
+        layer = layers_plus_lmhead[i].to(dev)
 
         subset = find_layers(layer)
+        print(i, subset)
         
         gpts = {}
         for name in subset:
@@ -102,24 +129,40 @@ def opt_sequential(model, dataloader, dev):
         handles = []
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+        
+        outs = [None for _ in range(args.nsamples)]
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            if i < len(layers):
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            else:
+                outs[j] = layer(inps[j].unsqueeze(0))[0]
         for h in handles:
             h.remove()
+        outs = torch.cat(outs, dim=0)
 
         for name in gpts:
             print(i, name)
-            print('Pruning ...')
+            # print('Pruning ...')
             sparsity = args.sparsity
+            if i == len(layers_plus_lmhead) - 1:
+                sparsity = args.lm_head_sparsity
+            if i == len(layers_plus_lmhead) - 2 and len(layers_plus_lmhead) >= len(layers) + 2:
+                sparsity = args.proj_out_sparsity
+            print(i, 'sparsity=', sparsity)
             gpts[name].fasterprune(
                 sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
             )
             gpts[name].free()
 
+        outs = [None for _ in range(args.nsamples)]
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            if i < len(layers):
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            else:
+                outs[j] = layer(inps[j].unsqueeze(0))[0]
+        outs = torch.cat(outs, dim=0)
 
-        layers[i] = layer.cpu()
+        layers_plus_lmhead[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
 
@@ -183,7 +226,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     attention_mask = cache['attention_mask']
 
     for i in range(len(layers)):
-        print(i)
+        print('layer', i, flush=True)
         layer = layers[i].to(dev)
 
         if args.gmp:
@@ -262,6 +305,14 @@ if __name__ == '__main__':
         help='Target sparsity'
     )
     parser.add_argument(
+        '--proj_out_sparsity', type=float, default=0,
+        help='Target sparsity'
+    )
+    parser.add_argument(
+        '--lm_head_sparsity', type=float, default=0,
+        help='Target sparsity'
+    )
+    parser.add_argument(
         '--prunen', type=int, default=0,
         help='N for N:M pruning.'
     )
@@ -313,6 +364,7 @@ if __name__ == '__main__':
         assert has_wandb, "wandb not installed try `pip install wandb`"
         wandb.init(config=args)
 
+    print(args)
     model = get_opt(args.model)
     model.eval()
 
@@ -325,11 +377,11 @@ if __name__ == '__main__':
         opt_sequential(model, dataloader, DEV)
         for n, p in model.named_parameters():
             print(n, torch.mean((p == 0).float()))
-            if 'fc2' in n:
-                break
-        print(time.time() - tick, flush=True)
+            # if 'fc2' in n:
+            #     break
+        print('cost time:', time.time() - tick, flush=True)
 
-    for dataset in ['wikitext2', 'ptb', 'c4']:
+    for dataset in ['wikitext2', 'ptb', 'c4'][:1]:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
@@ -338,3 +390,4 @@ if __name__ == '__main__':
 
     if args.save:
         model.save_pretrained(args.save)
+    print('End!')
